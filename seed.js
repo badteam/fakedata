@@ -2,24 +2,22 @@
 
 import { initializeApp, cert } from 'firebase-admin/app';
 import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
-import crypto from 'node:crypto';
 
 // ================== Credentials ==================
-function getServiceAccount() {
+async function getServiceAccount() {
   // A) Secret واحد JSON خام
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
   const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
   if (raw) return JSON.parse(raw);
   if (b64) return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
 
-  // B) 3 Secrets منفصلة (زي الصورة عندك)
+  // B) 3 Secrets منفصلة (زي اللي عندك)
   const pid = process.env.FIREBASE_PROJECT_ID;
   const email = process.env.FIREBASE_CLIENT_EMAIL;
   let key = process.env.FIREBASE_PRIVATE_KEY;
 
   if (pid && email && key) {
-    // GitHub secrets غالباً بتبقى الnewline مكتوبة "\n"
-    if (key.includes('\\n')) key = key.replace(/\\n/g, '\n');
+    if (key.includes('\\n')) key = key.replace(/\\n/g, '\n'); // fix newlines
     return {
       type: 'service_account',
       project_id: pid,
@@ -30,10 +28,9 @@ function getServiceAccount() {
 
   // C) تشغيل محلي بملف service-account.json (اختياري)
   try {
-    // dynamic import to work in ESM
     const sa = await import('./service-account.json', { assert: { type: 'json' } });
     return sa.default;
-  } catch (e) {
+  } catch {
     throw new Error(
       'No credentials found. Provide FIREBASE_SERVICE_ACCOUNT (JSON) OR FIREBASE_PROJECT_ID/CLIENT_EMAIL/PRIVATE_KEY OR add service-account.json'
     );
@@ -44,9 +41,12 @@ const app = initializeApp({ credential: cert(await getServiceAccount()) });
 const db = getFirestore(app);
 
 // ================== Config ==================
-const USERS_COUNT = 20;
+const EMP_COUNT = Number(process.env.EMP_COUNT ?? 20);
+
+// لو محددتش SEED_MONTH: هيستخدم آخر N يوم
+const SEED_MONTH = (process.env.SEED_MONTH || '').trim(); // "YYYY-MM" أو فاضي
 const SEED_ATTENDANCE = (process.env.SEED_ATTENDANCE ?? 'true').toLowerCase() !== 'false';
-const DAYS = Number(process.env.SEED_ATTENDANCE_DAYS ?? 7);
+const DAYS_DEFAULT = Number(process.env.SEED_ATTENDANCE_DAYS ?? 7);
 const PRESENT_PROB = Number(process.env.PRESENT_PROB ?? 0.8); // 80% حضور
 
 // ================== Helpers ==================
@@ -80,6 +80,35 @@ function randomClockOnDate(baseDate, baseHour, varianceMin) {
   const offset = randInt(-varianceMin, varianceMin);
   d.setMinutes(d.getMinutes() + offset);
   return d;
+}
+
+// days generator: يدعم شهر كامل أو آخر N يوم
+function generateDates() {
+  if (SEED_MONTH) {
+    // توقع "YYYY-MM"
+    const m = /^(\d{4})-(\d{2})$/.exec(SEED_MONTH);
+    if (!m) throw new Error(`SEED_MONTH must be YYYY-MM, got "${SEED_MONTH}"`);
+    const year = Number(m[1]);
+    const month = Number(m[2]); // 1..12
+    const first = new Date(year, month - 1, 1);
+    const dates = [];
+    const last = new Date(year, month, 0); // آخر يوم في الشهر
+    for (let d = new Date(first); d <= last; d.setDate(d.getDate() + 1)) {
+      const copy = new Date(d);
+      copy.setHours(0,0,0,0);
+      dates.push(copy);
+    }
+    return dates;
+  }
+  // default: آخر N يوم
+  const dates = [];
+  for (let i = 0; i < DAYS_DEFAULT; i++) {
+    const d = new Date();
+    d.setHours(0,0,0,0);
+    d.setDate(d.getDate() - i);
+    dates.push(d);
+  }
+  return dates;
 }
 
 // ================== Load branches & shifts ==================
@@ -146,15 +175,11 @@ function buildUserDoc(i, branch, shift) {
 }
 
 // ================== Attendance for one user ==================
-async function seedAttendanceForUser(user, days) {
+async function seedAttendanceForUser(user, dates) {
   const batch = db.batch();
   let count = 0;
 
-  for (let i = 0; i < days; i++) {
-    const base = new Date();
-    base.setHours(0, 0, 0, 0);
-    base.setDate(base.getDate() - i);
-
+  for (const base of dates) {
     const key = dayKey(base);
 
     if (prob(PRESENT_PROB)) {
@@ -236,13 +261,17 @@ async function seedAttendanceForUser(user, days) {
 // ================== Main ==================
 (async function main() {
   console.log('🚀 Seeding start (Node', process.version, ')');
+  console.log('EMP_COUNT:', EMP_COUNT, '| SEED_MONTH:', SEED_MONTH || '(last-N-days)');
+
   const branches = await loadBranches();
   const shifts = await loadShifts();
-  console.log(`Branches: ${branches.length}, Shifts: ${shifts.length}`);
+  const dates = generateDates();
+
+  console.log(`Branches: ${branches.length}, Shifts: ${shifts.length}, Days to seed: ${dates.length}`);
 
   const users = [];
 
-  for (let i = 1; i <= USERS_COUNT; i++) {
+  for (let i = 1; i <= EMP_COUNT; i++) {
     const code = `EMP-${String(i).padStart(3, '0')}`;
     const ref = db.collection('users').doc(code);
     const snap = await ref.get();
@@ -250,10 +279,12 @@ async function seedAttendanceForUser(user, days) {
     const br = rand(branches);
     const sh = rand(shifts);
 
+    const baseDoc = buildUserDoc(i, br, sh);
+
     const payload = snap.exists
       ? {
           // تطبيع الموجود + ضمان مفاتيح التوافق
-          ...buildUserDoc(i, br, sh),
+          ...baseDoc,
           ...(snap.data() || {}),
           code,
           status: 'approved',
@@ -265,11 +296,11 @@ async function seedAttendanceForUser(user, days) {
           fullName:
             (snap.data() || {}).fullName ??
             (snap.data() || {}).name ??
-            buildUserDoc(i, br, sh).name,
+            baseDoc.name,
           name:
             (snap.data() || {}).name ??
             (snap.data() || {}).fullName ??
-            buildUserDoc(i, br, sh).name,
+            baseDoc.name,
           primaryBranchId:
             (snap.data() || {}).primaryBranchId ??
             (snap.data() || {}).branchId ??
@@ -280,7 +311,7 @@ async function seedAttendanceForUser(user, days) {
             sh.id,
           updatedAt: FieldValue.serverTimestamp(),
         }
-      : buildUserDoc(i, br, sh);
+      : baseDoc;
 
     await ref.set(payload, { merge: true });
     users.push({ id: code, ...payload });
@@ -291,9 +322,9 @@ async function seedAttendanceForUser(user, days) {
   if (SEED_ATTENDANCE) {
     let total = 0;
     for (const u of users) {
-      total += await seedAttendanceForUser(u, DAYS);
+      total += await seedAttendanceForUser(u, dates);
     }
-    console.log(`✅ Attendance inserted: ${total} docs for last ${DAYS} day(s).`);
+    console.log(`✅ Attendance inserted: ${total} docs (${dates.length} day(s) × ${users.length} user(s), p=${PRESENT_PROB}).`);
   } else {
     console.log('ℹ️ Skipped attendance seeding (SEED_ATTENDANCE=false).');
   }
